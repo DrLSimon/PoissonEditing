@@ -76,20 +76,29 @@ def rand_like(x):
     return np.random.rand(*x.shape)
 
 
-def poisson_edit(source, target, smoothing_margin=0, callback=None):
+def construct_laplacian(source, target, mode, param):
+    source_laplacian = compute_laplacian(source)
+    target_laplacian = compute_laplacian(target)
+    if mode == 'replace':
+        result_laplacian = source_laplacian
+        if param > 0:
+            result_laplacian = combine_gradually(source_laplacian, target_laplacian, param)
+    elif mode == 'blending':
+        result_laplacian = (1-param)*source_laplacian + param*target_laplacian
+    else:
+        print("Invalid mode selected. Use --help for usage information.")
+        quit()
+    return result_laplacian
+
+def poisson_edit(source, target, mode, param, callback=None):
     """
     Applies Poisson Editing: blends source into target.
     """
-    source_laplacian = compute_laplacian(source)
-    target_laplacian = compute_laplacian(target)
-    source_laplacian = 0.5*(source_laplacian + target_laplacian)
-    if smoothing_margin>0:
-        target_laplacian = compute_laplacian(target)
-        source_laplacian = combine_gradually(source_laplacian, target_laplacian, smoothing_margin)
-    source_laplacian_with_target_borders = paste_source_borders_on_target(source=target, target=source_laplacian)
+    laplacian = construct_laplacian(source, target, mode, param)
+    laplacian_with_target_borders = paste_source_borders_on_target(source=target, target=laplacian)
 
     # Right-hand side of the equation
-    b = source_laplacian_with_target_borders.ravel()
+    b = laplacian_with_target_borders.ravel()
 
     A = create_operator(source.shape)
 
@@ -135,68 +144,97 @@ def on_target_selected(eclick, erelease):
     target_selected = True
     print(f"Target selected (pixels): {target_coords}")
 
-def on_apply_poisson(event):
-    global source_selected, target_selected
 
-    if source_selected and target_selected:
-        # Extract the source region using NumPy views
-        x1_src, y1_src, x2_src, y2_src = source_coords
-        source_region = source_img[y1_src:y2_src, x1_src:x2_src]
+class PoissonEditor(object):
+    def __init__(self, mode, param):
+        self.source_img = color.rgb2gray(img_as_float(data.astronaut()))
+        self.target_img = color.rgb2gray(img_as_float(data.coffee()))
+        self.mode = mode
+        self.param = param
 
-        # Target region
-        x1_tgt, y1_tgt, x2_tgt, y2_tgt = target_coords
-        target_region_for_display = target_img[y1_tgt:y2_tgt, x1_tgt:x2_tgt]
-        target_region = target_region_for_display.copy()
+    def on_apply_poisson(self, ax_result):
+        if source_selected and target_selected:
+            # Extract the source region using NumPy views
+            x1_src, y1_src, x2_src, y2_src = source_coords
+            source_region = self.source_img[y1_src:y2_src, x1_src:x2_src]
 
-        # Resize the source region to match the target region size
-        resized_source = transform.resize(source_region, target_region.shape, mode='reflect', anti_aliasing=True)
+            # Target region
+            x1_tgt, y1_tgt, x2_tgt, y2_tgt = target_coords
+            target_region_for_display = self.target_img[y1_tgt:y2_tgt, x1_tgt:x2_tgt]
+            target_region = target_region_for_display.copy()
 
-        # Create a callback function that updates the blended image
-        def callback(x):
-            blended_img = final_blend(target_region,  x)  # Current solution reshaped as image
+            # Resize the source region to match the target region size
+            resized_source = transform.resize(source_region, target_region.shape, mode='reflect', anti_aliasing=True)
+
+            # Create a callback function that updates the blended image
+            def callback(x):
+                blended_img = final_blend(target_region,  x)  # Current solution reshaped as image
+                target_region_for_display[:,:] = blended_img
+                ax_result.imshow(np.clip(self.target_img,0,1), cmap='gray')
+                plt.draw()
+                plt.pause(0.01)  # Add a brief pause to allow the plot to update visually
+                
+
+            # Apply Poisson editing with a callback for interactive visualization
+            blended_img = poisson_edit(
+                resized_source,
+                target_region,
+                self.mode,
+                self.param,
+                callback=callback
+            )
+
+            # Display the final result
             target_region_for_display[:,:] = blended_img
-            ax_result.imshow(np.clip(target_img,0,1), cmap='gray')
+            ax_result.imshow(np.clip(self.target_img,0,1), cmap='gray')
             plt.draw()
-            plt.pause(0.01)  # Add a brief pause to allow the plot to update visually
-            
 
-        # Apply Poisson editing with a callback for interactive visualization
-        blended_img = poisson_edit(
-            resized_source,
-            target_region,
-            smoothing_margin=0,
-            callback=callback
-        )
+import argparse
 
-        # Display the final result
-        target_region_for_display[:,:] = blended_img
-        ax_result.imshow(np.clip(target_img,0,1), cmap='gray')
-        plt.draw()
+def parse_args():
+    # Create the argument parser
+    parser = argparse.ArgumentParser(description='Image Editing Tool')
+
+    # Add the '--mode' argument
+    parser.add_argument('--mode', type=str, choices=['replace', 'blending'], help='Select editing mode (poisson or blending)')
+
+    # Add the '--param' argument
+    parser.add_argument('--param', type=float, default=0.2, help='Specify the parameter (transition radius for replace, or blend factor)')
+
+    # Parse the arguments
+    args = parser.parse_args()
 
 
-# Load Images
-source_img = color.rgb2gray(img_as_float(data.astronaut()))
-target_img = color.rgb2gray(img_as_float(data.coffee()))
+    return args
 
-source_selected = False
-target_selected = False
+def main():
+    args = parse_args()
 
-# Create figure and axes
-fig, (ax1, ax2, ax_result) = plt.subplots(1, 3, figsize=(15, 5))
-ax1.imshow(source_img, cmap='gray')
-ax1.set_title("Source Image")
-ax2.imshow(target_img, cmap='gray')
-ax2.set_title("Target Image")
-ax_result.set_title("Blended Image")
+    editor = PoissonEditor(args.mode, args.param)
 
-# Set up region selectors
-source_selector = RegionSelector(ax1, source_img, on_source_selected)
-target_selector = RegionSelector(ax2, target_img, on_target_selected)
+    source_selected = False
+    target_selected = False
 
-# Add Apply Poisson button
-apply_poisson_button = plt.axes([0.4, 0.05, 0.2, 0.075])  # Button placement
-button = plt.Button(apply_poisson_button, 'Apply Poisson Editing')
-button.on_clicked(on_apply_poisson)
+    # Create figure and axes
+    fig, (ax1, ax2, ax_result) = plt.subplots(1, 3, figsize=(15, 5))
+    ax1.imshow(editor.source_img, cmap='gray')
+    ax1.set_title("Source Image")
+    ax2.imshow(editor.target_img, cmap='gray')
+    ax2.set_title("Target Image")
+    ax_result.set_title("Blended Image")
 
-plt.show()
+    # Set up region selectors
+    source_selector = RegionSelector(ax1, editor.source_img, on_source_selected)
+    target_selector = RegionSelector(ax2, editor.target_img, on_target_selected)
 
+    # Add Apply Poisson button
+    apply_poisson_button = plt.axes([0.4, 0.05, 0.2, 0.075])  # Button placement
+    button = plt.Button(apply_poisson_button, 'Apply Poisson Editing')
+    button.on_clicked(lambda event: editor.on_apply_poisson(ax_result))
+
+    plt.show()
+
+
+
+if __name__ == "__main__":
+    main()
