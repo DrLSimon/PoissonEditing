@@ -1,8 +1,11 @@
 import numpy as np
-from scipy.sparse.linalg import LinearOperator, bicgstab
+from scipy.sparse.linalg import bicgstab
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector
 from skimage import data, img_as_float, color, transform
+
+from LinearOperator import LinearOperator, compose_linear_ops
+
 
 def combine_gradually(a, b, max_distance_fraction):
     # Check if images are the same size
@@ -36,17 +39,55 @@ def shift_image(image, shift_x=0, shift_y=0):
     
     return shifted_image
 
+def mask_inside_and_keep_border(shape):
+    N = np.prod(shape)
+    def matvec(x):
+        x_img = x.reshape(shape)
+        result = x_img.copy()
+        result[1:-1, 1:-1] = 0
+        return result.ravel()
+
+    #this is self adjoint  (diagonal with 0 and 1)
+    return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+
+def zero_pad_on_center_crop_operator(shape):
+    N = np.prod(shape)
+    def matvec(x):
+        x_img = x.reshape(shape)
+        result = np.zeros(shape)
+        result[1:-1, 1:-1] = x_img[1:-1, 1:-1]
+        return result.ravel()
+
+    #this is self adjoint since ZP^T=crop
+    return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+
+def laplacian_operator(shape):
+    N = np.prod(shape)
+    
+    def matvec(x):
+        source = x.reshape(shape)
+        laplacian = 4*source.copy()
+        for shift_x, shift_y in [(-1,0), (1,0), (0,-1), (0,1) ]:
+            laplacian -= shift_image(source, shift_x, shift_y)
+        return laplacian.ravel()
+    #this is self adjoint 
+    return LinearOperator((N, N), matvec=matvec, rmatvec=matvec, dtype=float)
+
+
+def inner_laplacian_operator(shape):
+    A = zero_pad_on_center_crop_operator(shape)
+    B = laplacian_operator(shape)
+    return compose_linear_ops(A, B) #not self adjoint
+
+
 # Poisson Editing Functions
-def compute_laplacian(source):
+def compute_laplacian(img):
     """
     Computes the Laplacian of the source image.
     """
-    h, w = source.shape
-    laplacian = 4*source.copy()
-    for shift_x, shift_y in [(-1,0), (1,0), (0,-1), (0,1) ]:
-        laplacian -= shift_image(source, shift_x, shift_y)
-
-    return laplacian
+    shape = img.shape
+    laplacian_operator = inner_laplacian_operator(shape)
+    return laplacian_operator.matvec(img.ravel()).reshape(shape)
 
 def paste_source_borders_on_target(source, target):
     result = target.copy()
@@ -55,21 +96,11 @@ def paste_source_borders_on_target(source, target):
     return result
 
 
-def create_operator(img_shape):
+def create_operator(shape):
     """
     Creates a LinearOperator that applies the Laplacian.
     """
-    h, w = img_shape
-    N = h * w
-
-    def matvec(x):
-        x_img = x.reshape(h, w)
-        laplacian = compute_laplacian(x_img)
-        result = paste_source_borders_on_target(x_img, laplacian)
-        return result.ravel()
-
-    A = LinearOperator((N, N), matvec=matvec)
-    return A
+    return mask_inside_and_keep_border(shape) + inner_laplacian_operator(shape)
 
 def lower_(source):
     """
@@ -156,21 +187,22 @@ def construct_laplacian(source, target, mode, param):
         quit()
     return result_laplacian
 
-def create_I_minus_Dinv_A(img_shape):
-    """
-    Creates a LinearOperator that applies the Laplacian.
-    """
-    h, w = img_shape
-    N = h * w
-
+def eye(shape):
+    N = np.prod(shape)
     def matvec(x):
-        x_img = x.reshape(h, w)
-        laplacian = compute_laplacian(x_img)
-        result = paste_source_borders_on_target(x_img, laplacian)
-        return x - diag_inv(result).ravel()
+        return x
+    return LinearOperator((N,N), matvec=matvec, rmatvec=matvec)
 
-    A = LinearOperator((N, N), matvec=matvec)
-    return A
+def diag_inv_op(shape):
+    N = np.prod(shape)
+    def matvec(x):
+        x = x.reshape(shape)
+        return diag_inv(x).ravel()
+    return LinearOperator((N,N), matvec=matvec, rmatvec=matvec)
+
+def create_I_minus_Dinv_A(shape, A):
+    I = eye(shape)
+    return I - compose_linear_ops(diag_inv_op(shape), A)
 
 
 
@@ -186,7 +218,7 @@ def poisson_edit(source, target, mode, param, callback=None):
 
     A = create_operator(source.shape)
     M = create_preconditionner(source.shape)
-    I_minus_Dinv_A = create_I_minus_Dinv_A(source.shape)
+    I_minus_Dinv_A = create_I_minus_Dinv_A(source.shape, A)
     import scipy
     from scipy.linalg import interpolative
     rho = interpolative.estimate_spectral_norm(I_minus_Dinv_A)
@@ -198,7 +230,7 @@ def poisson_edit(source, target, mode, param, callback=None):
     # x = np.zeros_like(b) #rand_like(b)
 
     # Solve the system using bicgstab
-    x, info = bicgstab(A, b, x0=x, maxiter=200, rtol=1e-9, callback=callback)
+    x, info = bicgstab(A, b, x0=x, maxiter=2000, rtol=1e-9, callback=callback)
     callback(x)
     print(f'Done with the optim {info=}')
 
